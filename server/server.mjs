@@ -1,193 +1,146 @@
-// server/server.mjs
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
-import { GoogleGenerativeAI } from '@google/generative-ai'
+import Groq from 'groq-sdk'
 
 dotenv.config()
 
 const app = express()
 
-app.use(
-  cors({
-    origin: 'http://localhost:5173',
-  })
-)
+app.use(cors({ origin: 'http://localhost:5173' }))
 app.use(express.json())
 
-// --------- GEMINI SETUP ----------
-const apiKey = process.env.GEMINI_API_KEY
-
-if (!apiKey) {
-  console.error('❌ GEMINI_API_KEY is NOT set in .env')
-} else {
-  console.log('✅ GEMINI_API_KEY loaded (first 6 chars):', apiKey.slice(0, 6))
+// ===============================
+// GROQ INIT (SAFE + LOGGED)
+// ===============================
+if (!process.env.GROQ_API_KEY) {
+  console.error('❌ GROQ_API_KEY missing')
+  process.exit(1)
 }
 
-const genAI = apiKey ? new GoogleGenerativeAI(apiKey) : null
-const model =
-  genAI && genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
+const MODEL = 'llama-3.1-8b-instant'
+console.log('✅ Using Groq model:', MODEL)
 
-// JSON extractor
-function extractJson(text) {
-  try {
-    return JSON.parse(text)
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/)
-    if (!match) throw new Error('No JSON object found in model response')
-    return JSON.parse(match[0])
-  }
-}
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+})
 
-// --------- ROUTES ----------
+// ===============================
+// HEALTH
+// ===============================
 app.get('/api/health', (req, res) => {
   res.json({ ok: true })
 })
 
-
-// =============================
-// INGREDIENT ANALYZER (ENHANCED)
-// =============================
+// ===============================
+// INGREDIENT ANALYZER (AI)
+// ===============================
 app.post('/api/analyze-ingredients', async (req, res) => {
-  if (!model)
-    return res.status(500).json({ error: 'Server missing Gemini API key' })
-
   const { text } = req.body || {}
-  if (!text?.trim())
+
+  if (!text?.trim()) {
     return res.status(400).json({ error: 'Missing ingredient text' })
+  }
 
   try {
-    const prompt = `
-You are an expert nutritionist specializing in safe, simple guidance for Indian families, teens and students.
+    const completion = await groq.chat.completions.create({
+      model: MODEL,
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a nutrition expert for Indian students. Return ONLY valid JSON.',
+        },
+        {
+          role: 'user',
+          content: `
+Analyze the ingredient list:
+"${text}"
 
-Analyze the following ingredient list:
-"""${text}"""
-
-First, split it into clean individual ingredients.
-
-For each ingredient, classify it as EXACTLY one of:
-- "Good"
-- "Moderate"
-- "Limit"
-- "Unknown"
-
-Now generate **a long, detailed, helpful overall verdict** (6–10 sentences):
-
-Your verdict MUST:
-- Explain the healthiness of this product.
-- Identify harmful ingredients (like palm oil, flavor enhancers, artificial colors, preservatives).
-- Explain WHY they may be harmful.
-- Mention anything students or families should be careful about.
-- Give simple nutrition advice.
-- Keep it friendly and non-judgmental.
-
-⚠️ Return ONLY valid JSON in this exact structure:
-
+Return ONLY JSON:
 {
   "items": [
-    { "name": "Ingredient", "label": "Good" }
+    { "name": "Ingredient", "label": "Good | Moderate | Limit | Unknown" }
   ],
-  "overallVerdict": "A long, 6–10 sentence nutritionist-style explanation."
+  "overallVerdict": "6–8 sentence explanation"
 }
-    `.trim()
-
-    const result = await model.generateContent(prompt)
-    const textResponse = result.response.text()
-
-    console.log('🔎 Raw Gemini response for /analyze-ingredients:')
-    console.log(textResponse)
-
-    const json = extractJson(textResponse)
-
-    if (!Array.isArray(json.items) || typeof json.overallVerdict !== 'string') {
-      throw new Error('Model JSON missing items or overallVerdict')
-    }
-
-    return res.json(json)
-  } catch (err) {
-    console.error('❌ Error in /api/analyze-ingredients:', err)
-    return res.status(500).json({
-      error: err.message || 'Gemini ingredient analysis error',
+`,
+        },
+      ],
     })
+
+    const raw = completion.choices[0].message.content
+    const json = JSON.parse(raw.match(/\{[\s\S]*\}/)[0])
+
+    res.json(json)
+  } catch (err) {
+    console.error('❌ Ingredient AI error:', err)
+    res.status(500).json({ error: 'AI analysis failed' })
   }
 })
 
-
-// =============================
-// DIET PLANNER
-// =============================
+// ===============================
+// DIET PLANNER (AI)
+// ===============================
 app.post('/api/generate-diet-plan', async (req, res) => {
-  if (!model)
-    return res.status(500).json({ error: 'Server missing Gemini API key' })
-
   const { age, heightCm, weightKg, goal } = req.body || {}
 
-  if (!age || !heightCm || !weightKg || !goal)
-    return res.status(400).json({
-      error: 'Missing age, heightCm, weightKg or goal',
-    })
+  if (!age || !heightCm || !weightKg || !goal) {
+    return res.status(400).json({ error: 'Missing fields' })
+  }
 
   try {
-    const prompt = `
-You are a friendly Indian nutrition coach.
+    const completion = await groq.chat.completions.create({
+      model: MODEL,
+      temperature: 0.3,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a friendly Indian nutrition coach. Return ONLY JSON.',
+        },
+        {
+          role: 'user',
+          content: `
+Age: ${age}
+Height: ${heightCm} cm
+Weight: ${weightKg} kg
+Goal: ${goal}
 
-User:
-- Age: ${age}
-- Height: ${heightCm} cm
-- Weight: ${weightKg} kg
-- Goal: ${goal}
-
-Create a JSON response with:
-
-1. BMI (numeric)
-2. Short BMI summary
-3. Simple 1-day Indian meal plan:
-   - breakfast
-   - lunch
-   - snack
-   - dinner
-4. A friendly safety note.
-
-Return ONLY this JSON:
-
+Return ONLY JSON:
 {
   "bmiInfo": {
     "bmi": 22.0,
-    "summary": "Normal range."
+    "summary": "Normal BMI range"
   },
   "plan": {
-    "breakfast": "Text...",
-    "lunch": "Text...",
-    "snack": "Text...",
-    "dinner": "Text..."
+    "breakfast": "",
+    "lunch": "",
+    "snack": "",
+    "dinner": ""
   },
-  "note": "Short note."
+  "note": ""
 }
-    `.trim()
+`,
+        },
+      ],
+    })
 
-    const result = await model.generateContent(prompt)
-    const textResponse = result.response.text()
+    const raw = completion.choices[0].message.content
+    const json = JSON.parse(raw.match(/\{[\s\S]*\}/)[0])
 
-    console.log('🔎 Raw Gemini response for /generate-diet-plan:')
-    console.log(textResponse)
-
-    const json = extractJson(textResponse)
-
-    if (!json.bmiInfo || !json.plan)
-      throw new Error('Missing bmiInfo or plan')
-
-    return res.json(json)
+    res.json(json)
   } catch (err) {
-    console.error('❌ Error in /api/generate-diet-plan:', err)
-    return res
-      .status(500)
-      .json({ error: err.message || 'Gemini diet plan error' })
+    console.error('❌ Diet AI error:', err)
+    res.status(500).json({ error: 'Diet plan failed' })
   }
 })
 
-
-// --------- START SERVER ----------
-const PORT = 4000
+// ===============================
+// START SERVER
+// ===============================
+const PORT = process.env.PORT || 4000
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`)
 })
